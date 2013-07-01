@@ -100,12 +100,6 @@ static const int WAIT_TIME_MICRO_SEC = 100 * 1000;            // 0.1 s
 static const int MAX_WAIT_TIME_MICRO_SEC = 120 * 1000 * 1000; // 120 s
 
 /*
- * TODO, remove these two global variables
- */
-static orte_jobid_t jobid;
-static orte_odls_job_t* jobdat;
-
-/*
  * Module functions (function pointers used in a struct)
  */
 static int orte_odls_yarn_launch_local_procs(opal_buffer_t *data);
@@ -140,6 +134,8 @@ static bool any_live_children(orte_jobid_t job);
 typedef struct {
     int detected_proc_num;
     int total_wait_time;
+    orte_jobid_t jobid;
+    orte_odls_job_t* jobdat;
 } yarn_local_monitor_t;
 
 /*
@@ -218,13 +214,10 @@ static void yarn_daemon_sync_recv(int status, orte_process_name_t* sender,
                      "%s odls:yarn:yarn_daemon_sync_recv: recved sync response from hnp, start tracking proc state",
                      ORTE_NAME_PRINT(ORTE_PROC_MY_NAME)));
 
-    yarn_local_monitor_t* mon = (yarn_local_monitor_t*)malloc(sizeof(yarn_local_monitor_t));
-    mon->detected_proc_num = 0;
-    mon->total_wait_time = 0;
     /*
      * since local procs are launched by YARN NM, we here just to check if procs are REALLY launched 
      */
-    monitor_local_launch(0, 0, mon);
+    monitor_local_launch(0, 0, cbdata);
 }
 
 
@@ -242,6 +235,21 @@ static orte_odls_child_t* get_local_child_by_id(orte_jobid_t jobid, orte_vpid_t 
     return NULL;
 }
 
+static int get_num_proc_in_local_job(orte_jobid_t jobid) {
+    opal_list_item_t *item;
+    orte_odls_child_t* child;
+    int num_local_procs = 0;
+    for (item = opal_list_get_first(&orte_local_children); 
+        item != opal_list_get_end(&orte_local_children);
+        item = opal_list_get_next(item)) {
+        child = (orte_odls_child_t*)item;
+        if (child->name->jobid == jobid) {
+            num_local_procs++;
+        }
+    }
+    return num_local_procs;
+}
+
 static void monitor_local_launch(int fd, short event, void* cbdata) {
     yarn_local_monitor_t* mon = (yarn_local_monitor_t*)cbdata;
     bool other_error = false; // other error (like cannot find proc correctly) will cause launch failed
@@ -249,7 +257,7 @@ static void monitor_local_launch(int fd, short event, void* cbdata) {
     opal_list_item_t *item;
     orte_odls_child_t* child;
     orte_vpid_t vpid;
-    int total_local_children_num = opal_list_get_size(&orte_local_children);
+    int total_local_children_num = get_num_proc_in_local_job(mon->jobid);
     struct dirent *ent;
 
     OPAL_OUTPUT_VERBOSE((5, orte_odls_globals.output,
@@ -267,7 +275,7 @@ static void monitor_local_launch(int fd, short event, void* cbdata) {
     char pid_dir[1024];
     strcpy(pid_dir, pid_root);
     int path_len = strlen(pid_dir);
-    sprintf(pid_dir + path_len, "/%u", jobid);
+    sprintf(pid_dir + path_len, "/%u", mon->jobid);
 
     // see files in pid path
     DIR* dirp = opendir(pid_dir);
@@ -284,7 +292,7 @@ static void monitor_local_launch(int fd, short event, void* cbdata) {
                 // error when fork child process
                 if (strstr(ent->d_name, "_err")) {
                     vpid = get_vpid_from_err_file(ent->d_name);
-                    child = get_local_child_by_id(jobid, vpid);
+                    child = get_local_child_by_id(mon->jobid, vpid);
                     if (!child) {
                         ORTE_ERROR_LOG(ORTE_ERR_NOT_FOUND);
                         other_error = true;
@@ -301,7 +309,7 @@ static void monitor_local_launch(int fd, short event, void* cbdata) {
 
                 // not error, get filename/length
                 vpid = get_vpid_from_normal_file(ent->d_name);
-                child = get_local_child_by_id(jobid, vpid);
+                child = get_local_child_by_id(mon->jobid, vpid);
                 if (!child) {
                     ORTE_ERROR_LOG(ORTE_ERR_NOT_FOUND);
                     other_error = true;
@@ -371,7 +379,7 @@ ORTE_ERROR_LOG(ORTE_ERR_NOT_FOUND);
 
     // send launch app report to HNP
     OBJ_CONSTRUCT(&alert, opal_buffer_t);
-    if (ORTE_SUCCESS != (rc = pack_state_update(&alert, true, jobdat))) {
+    if (ORTE_SUCCESS != (rc = pack_state_update(&alert, true, mon->jobdat))) {
         ORTE_ERROR_LOG(rc);
     }
 
@@ -400,7 +408,7 @@ ORTE_ERROR_LOG(ORTE_ERR_NOT_FOUND);
     // start to query finished processes, every 1 sec
     opal_event_t* ev = NULL;
     ev = (opal_event_t*)malloc(sizeof(opal_event_t));
-    opal_evtimer_set(ev, wait_process_completed, NULL);
+    opal_evtimer_set(ev, wait_process_completed, mon->jobid);
     struct timeval delay;
     delay.tv_sec = 1;
     delay.tv_usec = 0;
@@ -451,6 +459,9 @@ static int pack_state_for_proc(opal_buffer_t *alert, bool include_startup_info, 
     return ORTE_SUCCESS;
 }
 
+/*
+ * simply copied from odls_base_fns, because we cannot access it
+ */
 static int pack_state_update(opal_buffer_t *alert, bool include_startup_info, orte_odls_job_t *jobdat)
 {
     int rc;
@@ -504,6 +515,7 @@ static void wait_process_completed(int fd, short event, void* cbdata) {
     int rc;
     opal_list_item_t *item;
     orte_odls_child_t* child;
+    orte_jobid_t jobid = (orte_jobid_t)cbdata;
     orte_vpid_t vpid;
     int completed_proc_num = 0;
     struct dirent *ent;
@@ -604,12 +616,12 @@ static void wait_process_completed(int fd, short event, void* cbdata) {
 
 MOVEON:
     
-    // register anoter check if any living children exist
+    // register another check if any living children exist
     if (any_live_children(jobid)) {
         // start process to query finished processes
         opal_event_t* ev = NULL;
         ev = (opal_event_t*)malloc(sizeof(opal_event_t));
-        opal_evtimer_set(ev, wait_process_completed, NULL);
+        opal_evtimer_set(ev, wait_process_completed, jobid);
         struct timeval delay;
         delay.tv_sec = 1;
         delay.tv_usec = 0;
@@ -944,6 +956,8 @@ static int orte_odls_yarn_launch_local_procs(opal_buffer_t *data)
     opal_buffer_t *msg;
     opal_list_item_t *item;
     orte_odls_child_t *child;
+    orte_jobid_t jobid;
+    orte_odls_job_t* jobdat;
 
     /* construct the list of children we are to launch */
     if (ORTE_SUCCESS != (rc = orte_odls_base_default_construct_child_list(data, &jobid))) {
@@ -980,11 +994,17 @@ static int orte_odls_yarn_launch_local_procs(opal_buffer_t *data)
         child->state = ORTE_PROC_STATE_INIT;
     }
 
+    yarn_local_monitor_t* mon = (yarn_local_monitor_t*)malloc(sizeof(yarn_local_monitor_t));
+    mon->detected_proc_num = 0;
+    mon->total_wait_time = 0;
+    mon->jobid = jobid;
+    mon->jobdat = jobdat;
+
     /* register a callback for hnp sync response */
     if (ORTE_SUCCESS != (rc = orte_rml.recv_buffer_nb(ORTE_NAME_WILDCARD,
                                                       ORTE_RML_TAG_YARN_SYNC_RESPONSE,
                                                       ORTE_RML_PERSISTENT,
-                                                      yarn_daemon_sync_recv, NULL))) {
+                                                      yarn_daemon_sync_recv, mon))) {
         ORTE_ERROR_LOG(rc);
         return rc;
     }

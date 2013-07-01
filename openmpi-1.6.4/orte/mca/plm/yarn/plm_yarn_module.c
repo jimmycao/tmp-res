@@ -83,11 +83,14 @@
 #define ORTE_RML_TAG_YARN_SYNC_RESPONSE     98
 
 extern char** environ;
-static int num_sync_daemons = 0;
-static int num_completed_daemon_procs = 0;
-static int num_completed_jdata_procs = 0;
 static bool appmaster_finished = false;
 
+typedef struct {
+    int num_sync_daemons = 0;
+    int num_completed_daemon_procs = 0;
+    int num_completed_jdata_procs = 0;
+    orte_job_t* jdata = NULL;
+} yarn_plm_job_t;
 
 /*
  * Local functions
@@ -104,7 +107,7 @@ static int plm_yarn_finalize(void);
  * Local intermediate functions
  */
 
-static int launch_daemons(orte_job_t* jdata);
+static int launch_daemons(orte_job_t* jdata, int new_added_daemon_num);
 static int setup_daemon_proc_env_and_argv(orte_proc_t* proc, char ***pargv,
         int *argc, char ***penv);
 
@@ -116,11 +119,11 @@ static int plm_yarn_actual_launch_procs(orte_job_t* jdata);
 static int setup_proc_env_and_argv(orte_job_t* jdata, orte_app_context_t* app,
         orte_proc_t* proc, char ***pargv, char ***penv);
 
-static void heartbeat_with_AM_cb(int fd, short event, void *data);
+static void heartbeat_with_am_cb(int fd, short event, void *data);
 static void finish_app_master(bool succeed);
 static void process_state_monitor_cb(int fd, short args, void *cbdata);
 
-static int common_launch_process(orte_job_t *jdata, bool launch_daemon, int *launched_proc_num);
+static int common_launch_process(orte_job_t *jdata, bool launch_daemon, int new_added_daemon_num, int *launched_proc_num);
 
 
 
@@ -242,7 +245,7 @@ static int setup_daemon_proc_env_and_argv(orte_proc_t* proc, char ***pargv,
     return 0;
 }
 
-static int common_launch_process(orte_job_t *jdata, bool launch_daemon, int *launched_proc_num)
+static int common_launch_process(orte_job_t *jdata, bool launch_daemon, int new_added_daemon_num, int *launched_proc_num)
 {
 	int i, rc;
 	orte_proc_t* proc = NULL;
@@ -279,6 +282,20 @@ static int common_launch_process(orte_job_t *jdata, bool launch_daemon, int *lau
 
 	/* when launch_daemon, start from 1 because we don't need launch HNP process */
 	i = launch_daemon ? 1 : 0;
+    if (launch_daemon) {
+        i = jdata->num->procs - new_added_daemon_num;
+        if (i < 0) {
+            opal_output(0, "%s plm:yarn:common_launch_process: failed to launch daemon,  \
+                because new_added_daemon_num larger than num proc in the daemon job",
+                ORTE_NAME_PRINT(ORTE_PROC_MY_NAME));
+            return ORTE_ERROR;
+        }
+    } else {
+        i = 0;
+    }
+
+    OPAL_OUTPUT_VERBOSE((5, orte_plm_globals.output, "%s plm:yarn:common_launch_process: we will launch [%d] procs for the job [%s]",
+                    ORTE_NAME_PRINT(ORTE_PROC_MY_NAME), jdata->num_procs, ORTE_JOBID_PRINT(jdata->jobid)));
 
 	for (; i < jdata->num_procs; i++) {
 		argv = NULL;
@@ -483,14 +500,14 @@ launch_failed:
 	    return ORTE_ERROR;
 }
 
-static int launch_daemons(orte_job_t* jdata)
+static int launch_daemons(orte_job_t* jdata, int new_added_daemon_num)
 {
     int rc;
     int launched_proc_num = 0;
 
     orte_job_t* daemons = orte_get_job_data_object(ORTE_PROC_MY_NAME->jobid);
 
-    rc = common_launch_process(daemons, true, &launched_proc_num);
+    rc = common_launch_process(daemons, true, new_added_daemon_num, &launched_proc_num);
 
     if (rc != ORTE_SUCCESS) {
     	return rc;
@@ -508,7 +525,7 @@ static int launch_daemons(orte_job_t* jdata)
 }
 
 
-static void heartbeat_with_AM_cb(int fd, short event, void *data)
+static void heartbeat_with_am_cb(int fd, short event, void *data)
 {
     int i, rc;
     orte_job_t *jdata = (orte_job_t*)data;
@@ -657,7 +674,7 @@ cleanup:
         struct timeval delay;
         delay.tv_sec = 1;
         delay.tv_usec = 0;
-        opal_evtimer_set(ev, heartbeat_with_AM_cb, jdata);
+        opal_evtimer_set(ev, heartbeat_with_am_cb, jdata);
         opal_evtimer_add(ev, &delay);
     }
 }
@@ -809,7 +826,10 @@ static int plm_yarn_launch_job(orte_job_t *jdata)
     delay.tv_sec = 1;
     delay.tv_usec = 0;
 
-    opal_evtimer_set(ev, heartbeat_with_AM_cb, jdata);
+    yarn_plm_job_t* yarn_job = (yarn_plm_job_t*)malloc(sizeof(yarn_plm_job_t));
+    yarn_plm->jdata = jdata;
+
+    opal_evtimer_set(ev, heartbeat_with_am_cb, yarn_job);
     opal_evtimer_add(ev, &delay);
     //===================================
 
@@ -872,7 +892,7 @@ static int plm_yarn_launch_job(orte_job_t *jdata)
                          ORTE_JOBID_PRINT(jdata->jobid)));
     
     /* set the active jobid */
-     active_job = jdata->jobid;
+    active_job = jdata->jobid;
     
     /* Get the map for this job */
     if (NULL == (map = orte_rmaps.get_job_map(active_job))) {
@@ -892,7 +912,7 @@ static int plm_yarn_launch_job(orte_job_t *jdata)
     }
 
     /* launch daemons */
-    if (ORTE_SUCCESS != (rc = launch_daemons(jdata))) {
+    if (ORTE_SUCCESS != (rc = launch_daemons(jdata, map->num_new_daemons))) {
         opal_output(0, "%s plm:yarn:plm_yarn_launch_job: launch deamon failed",
                 ORTE_NAME_PRINT(ORTE_PROC_MY_NAME));
         goto cleanup;
@@ -916,7 +936,7 @@ launch_apps:
     /* register recv callback for daemons sync request */
     if (ORTE_SUCCESS != (rc = orte_rml.recv_buffer_nb(ORTE_NAME_WILDCARD,
                     ORTE_RML_TAG_YARN_SYNC_REQUEST, ORTE_RML_PERSISTENT,
-                    yarn_hnp_sync_recv, jdata))) {
+                    yarn_hnp_sync_recv, yarn_job))) {
         ORTE_ERROR_LOG(rc);
         goto cleanup;
     }
@@ -968,15 +988,17 @@ static void yarn_hnp_sync_recv(int status, orte_process_name_t* sender,
 {
     /* get daemon job object */
     orte_job_t* daemons = orte_get_job_data_object(ORTE_PROC_MY_NAME->jobid);
+
+    yarn_plm_job_t* yarn_job = (yarn_plm_job_t*)cbdata;
     /* get user's job object */
-    orte_job_t* jdata = (orte_job_t*)cbdata;
+    orte_job_t* jdata = yarn_job->jdata;
     opal_buffer_t *msg;
     int rc;
 
-    num_sync_daemons++;
+    yarn_job->num_sync_daemons++;
 
     /* we got all daemons synced */
-    if (daemons->num_procs == num_sync_daemons) {
+    if (daemons->num_procs == yarn_job->num_sync_daemons) {
         OPAL_OUTPUT_VERBOSE((5, orte_plm_globals.output,
                         "%s plm:yarn:yarn_hnp_sync_recv: we got all daemons sync, will launch proc in NM",
                         ORTE_NAME_PRINT(ORTE_PROC_MY_NAME)));
@@ -1000,7 +1022,7 @@ static void yarn_hnp_sync_recv(int status, orte_process_name_t* sender,
 
     OPAL_OUTPUT_VERBOSE((5, orte_plm_globals.output,
                 "%s plm:yarn:yarn_hnp_sync_recv: we got [%d/%d] daemons yarn sync request",
-                ORTE_NAME_PRINT(ORTE_PROC_MY_NAME), num_sync_daemons, daemons->num_procs));
+                ORTE_NAME_PRINT(ORTE_PROC_MY_NAME), yarn_job->num_sync_daemons, daemons->num_procs));
 }
 
 
@@ -1022,7 +1044,7 @@ static int plm_yarn_actual_launch_procs(orte_job_t* jdata)
                     ORTE_JOBID_PRINT(jdata->jobid)));
 
 
-    rc = common_launch_process(jdata, false, &launched_proc_num);
+    rc = common_launch_process(jdata, false, 0, &launched_proc_num);
 
 	if (rc != ORTE_SUCCESS) {
 		return rc;
