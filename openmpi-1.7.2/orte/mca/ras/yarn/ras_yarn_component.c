@@ -37,6 +37,7 @@
  * Local functions
  */
 static int ras_yarn_open(void);
+static int ras_yarn_close(void);
 static int orte_ras_yarn_component_query(mca_base_module_t **module, int *priority);
 
 
@@ -56,9 +57,8 @@ orte_ras_yarn_component_t mca_ras_yarn_component = {
         
             /* Component open and close functions */
             ras_yarn_open,
-            NULL,
-            orte_ras_yarn_component_query,
-            ras_yarn_register
+            ras_yarn_close,
+            orte_ras_yarn_component_query
         },
         {
             /* The component is checkpoint ready */
@@ -68,6 +68,11 @@ orte_ras_yarn_component_t mca_ras_yarn_component = {
 };
 
 static int ras_yarn_open(void)
+{
+    return ORTE_SUCCESS;
+}
+
+static int ras_yarn_close(void)
 {
     return ORTE_SUCCESS;
 }
